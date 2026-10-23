@@ -5,6 +5,7 @@ import { tmpdir } from 'os';
 import { createSevenZipTempId, getSevenZip } from '../../../common/sevenzip';
 import { extractCb7Metadata } from '../../metadata/lib/cbz-metadata';
 import { extractCb7Cover } from '../../metadata/lib/cover-cb7';
+import { removeExtractedTree } from './cb7-extraction';
 import { CbzService, type ComicPageResult } from './cbz.service';
 
 /**
@@ -148,6 +149,108 @@ describe('CbzService CB7 pages against the real 7z module', () => {
 
       expect((await readFile(path)).equals(garbage)).toBe(true);
       await expect(mountpoints()).resolves.toEqual([]);
+    });
+  });
+
+  describe('cache byte budget', () => {
+    const [A, B, C] = [51, 52, 53];
+    const ARCHIVE_BYTES = 1000;
+
+    /** One 800 byte page plus a 200 byte non-page file, so the budget has to count every extracted file. */
+    async function writeArchive(fileId: number, pageBytes = 800, label = `archive${fileId}-`): Promise<string> {
+      const path = join(workspace, `${fileId}.cb7`);
+      const page = label + 'x'.repeat(pageBytes - label.length);
+      await writeFile(path, await buildSevenZip({ '1.jpg': page, 'notes.txt': 'n'.repeat(ARCHIVE_BYTES - 800) }));
+      return path;
+    }
+
+    function budgetedService(budgetBytes: number, paths: Record<number, string>): CbzService {
+      const service = new CbzService({
+        verifyFileAccess: vi.fn((fileId: number) => Promise.resolve({ format: 'cb7', absolutePath: paths[fileId] })),
+      } as any);
+      (service as any).sevenZipCacheBudgetBytes = budgetBytes;
+      return service;
+    }
+
+    async function extractedDirs(fileId: number): Promise<string[]> {
+      return (await getSevenZip()).FS.readdir('/').filter((name) => name.startsWith(`comic${fileId}_`));
+    }
+
+    async function firstPage(service: CbzService, fileId: number): Promise<string> {
+      const result = await service.streamPage(fileId, 0, user);
+      if (result.notModified) throw new Error('expected page bytes');
+      const chunks: Buffer[] = [];
+      for await (const chunk of result.stream) chunks.push(Buffer.from(chunk));
+      return Buffer.concat(chunks).toString();
+    }
+
+    afterEach(async () => {
+      const sevenZip = await getSevenZip();
+      for (const name of sevenZip.FS.readdir('/')) {
+        if (/^comic5\d_/.test(name)) removeExtractedTree(sevenZip.FS, `/${name}`);
+      }
+    });
+
+    it('evicts the least recently used extraction once the budget is exceeded, and re-extracts it on demand', async () => {
+      const service = budgetedService(2500, { [A]: await writeArchive(A), [B]: await writeArchive(B), [C]: await writeArchive(C) });
+
+      for (const id of [A, B, C]) await service.getPageCount(id, user);
+
+      expect(await extractedDirs(A)).toHaveLength(0);
+      expect(await extractedDirs(B)).toHaveLength(1);
+      expect(await extractedDirs(C)).toHaveLength(1);
+
+      expect(await firstPage(service, A)).toMatch(/^archive51-x+$/);
+
+      expect(await extractedDirs(A)).toHaveLength(1);
+      expect(await extractedDirs(B)).toHaveLength(0);
+      expect(await extractedDirs(C)).toHaveLength(1);
+    });
+
+    it('counts a cache hit as a use', async () => {
+      const service = budgetedService(2500, { [A]: await writeArchive(A), [B]: await writeArchive(B), [C]: await writeArchive(C) });
+
+      await service.getPageCount(A, user);
+      await service.getPageCount(B, user);
+      await firstPage(service, A);
+      await service.getPageCount(C, user);
+
+      expect(await extractedDirs(A)).toHaveLength(1);
+      expect(await extractedDirs(B)).toHaveLength(0);
+      expect(await extractedDirs(C)).toHaveLength(1);
+    });
+
+    it('still serves an archive larger than the budget, keeping it alone', async () => {
+      const service = budgetedService(500, { [A]: await writeArchive(A), [B]: await writeArchive(B) });
+
+      await expect(service.getPageCount(A, user)).resolves.toBe(1);
+      expect(await extractedDirs(A)).toHaveLength(1);
+
+      expect(await firstPage(service, B)).toMatch(/^archive52-x+$/);
+      expect(await extractedDirs(A)).toHaveLength(0);
+      expect(await extractedDirs(B)).toHaveLength(1);
+    });
+
+    it('keeps the running total right when a rewritten file replaces its extraction', async () => {
+      const paths = { [A]: await writeArchive(A), [B]: await writeArchive(B), [C]: await writeArchive(C) };
+      const service = budgetedService(2500, paths);
+
+      await service.getPageCount(A, user);
+      await service.getPageCount(B, user);
+
+      await writeArchive(A, 900, 'rewritten-');
+      await utimes(paths[A], new Date(), new Date(Date.now() + 60_000));
+      expect(await firstPage(service, A)).toMatch(/^rewritten-x+$/);
+
+      // 1000 (B) + 1100 (new A) fits; a total that still counted the old A would evict B here.
+      expect(await extractedDirs(A)).toHaveLength(1);
+      expect(await extractedDirs(B)).toHaveLength(1);
+
+      await service.getPageCount(C, user);
+
+      expect(await extractedDirs(A)).toHaveLength(1);
+      expect(await extractedDirs(B)).toHaveLength(0);
+      expect(await extractedDirs(C)).toHaveLength(1);
     });
   });
 });

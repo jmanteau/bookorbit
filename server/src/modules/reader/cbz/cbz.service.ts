@@ -1,8 +1,8 @@
-import { Injectable, NotFoundException, UnprocessableEntityException } from '@nestjs/common';
+import { Injectable, Logger, NotFoundException, UnprocessableEntityException } from '@nestjs/common';
 import { createHash } from 'crypto';
 import { Readable } from 'stream';
 import { stat } from 'fs/promises';
-import { createSevenZipTempId, getSevenZip, mountHostArchive } from '../../../common/sevenzip';
+import { createSevenZipTempId, getSevenZip, mountHostArchive, type SevenZipFS } from '../../../common/sevenzip';
 import { imageContentTypeFromPath } from '../../../common/image-content-type';
 import { detectComicContainerFormat } from '../../../common/comic-format-detect';
 import { extractRarEntry, isUnrarError, listRarEntries } from '../../../common/rar-file-reader';
@@ -91,7 +91,12 @@ interface SevenZipPages {
   dir: string;
   /** Paths relative to `dir`, in reading order. */
   pages: string[];
+  /** Size of everything extracted into `dir`, which is what the cache budget counts. */
+  bytes: number;
 }
+
+// efficiency: a fixed budget, not config, sized for a handful of large comics. A single archive over it is still served: it is kept alone.
+const SEVEN_ZIP_CACHE_BUDGET_BYTES = 512 * 1024 * 1024;
 
 export type ComicPageResult =
   { notModified: true; etag: string } | { notModified: false; etag: string; stream: NodeJS.ReadableStream; mimeType: string };
@@ -104,12 +109,15 @@ interface OpenedComic {
 
 @Injectable()
 export class CbzService {
+  private readonly logger = new Logger(CbzService.name);
   // CBZ: byte-offset index per fileId
   private readonly zipIndex = new Map<number, Stamped<CbzZipEntry[]>>();
   // CBR: sorted page names per fileId
   private readonly rarCache = new Map<number, Stamped<RarCache>>();
-  // CB7: extracted folder + sorted page paths per fileId (extracted files live in WASM VFS)
+  // CB7: extracted folder + sorted page paths per fileId (extracted files live in WASM VFS). Insertion order is recency, oldest first.
   private readonly sevenZPages = new Map<number, Stamped<SevenZipPages>>();
+  private sevenZipBytes = 0;
+  private sevenZipCacheBudgetBytes = SEVEN_ZIP_CACHE_BUDGET_BYTES;
   // Resolved actual format per fileId (magic bytes override stored extension)
   private readonly resolvedFormat = new Map<number, Stamped<ComicFormat>>();
 
@@ -146,11 +154,10 @@ export class CbzService {
   }
 
   private async invalidate(fileId: number): Promise<void> {
-    const sevenZip = this.sevenZPages.get(fileId);
     this.zipIndex.delete(fileId);
     this.rarCache.delete(fileId);
-    this.sevenZPages.delete(fileId);
     this.resolvedFormat.delete(fileId);
+    const sevenZip = this.forgetSevenZipEntry(fileId);
     if (sevenZip) removeExtractedTree((await getSevenZip()).FS, sevenZip.value.dir);
   }
 
@@ -220,7 +227,11 @@ export class CbzService {
 
   private async getSevenZPages(fileId: number, filePath: string, stamp: FileStamp): Promise<SevenZipPages> {
     const cached = this.sevenZPages.get(fileId);
-    if (cached && sameStamp(cached.stamp, stamp)) return cached.value;
+    if (cached && sameStamp(cached.stamp, stamp)) {
+      this.sevenZPages.delete(fileId);
+      this.sevenZPages.set(fileId, cached);
+      return cached.value;
+    }
 
     const sz = await getSevenZip();
 
@@ -244,19 +255,44 @@ export class CbzService {
       source?.release();
     }
 
+    const files = listExtractedFiles(sz.FS, dir);
+    const bytes = files.reduce((total, path) => total + sz.FS.stat(`${dir}/${path}`).size, 0);
+
     // Only the file name decides hidden, as it did when the archive was extracted flat.
-    const pages = listExtractedFiles(sz.FS, dir)
+    const pages = files
       .filter((path) => {
         const name = pathBasename(path);
         return isImage(name) && !name.startsWith('.');
       })
       .sort(compareComicPagePaths);
 
-    const previous = this.sevenZPages.get(fileId);
-    const value = { dir, pages };
+    const previous = this.forgetSevenZipEntry(fileId);
+    if (previous) removeExtractedTree(sz.FS, previous.value.dir);
+    const value = { dir, pages, bytes };
     this.sevenZPages.set(fileId, { stamp, value });
-    if (previous && previous.value.dir !== dir) removeExtractedTree(sz.FS, previous.value.dir);
+    this.sevenZipBytes += bytes;
+    this.evictSevenZipOverBudget(sz.FS, fileId);
     return value;
+  }
+
+  private forgetSevenZipEntry(fileId: number): Stamped<SevenZipPages> | undefined {
+    const entry = this.sevenZPages.get(fileId);
+    if (entry) {
+      this.sevenZPages.delete(fileId);
+      this.sevenZipBytes -= entry.value.bytes;
+    }
+    return entry;
+  }
+
+  private evictSevenZipOverBudget(fs: SevenZipFS, keepFileId: number): void {
+    for (const [fileId, entry] of this.sevenZPages) {
+      if (this.sevenZipBytes <= this.sevenZipCacheBudgetBytes || fileId === keepFileId) return;
+      this.forgetSevenZipEntry(fileId);
+      removeExtractedTree(fs, entry.value.dir);
+      this.logger.debug(
+        `[reader.cb7_cache_evict] [end] fileId=${fileId} bytes=${entry.value.bytes} totalBytes=${this.sevenZipBytes} budgetBytes=${this.sevenZipCacheBudgetBytes} - evicted cached CB7 extraction`,
+      );
+    }
   }
 
   // ── Public API ────────────────────────────────────────────────────────────────
