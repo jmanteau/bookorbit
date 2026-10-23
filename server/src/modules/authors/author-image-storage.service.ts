@@ -2,7 +2,8 @@ import { Injectable, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { lookup } from 'dns/promises';
 import { sanitizeLogValue } from '../../common/utils/log-sanitize.utils';
-import { access, copyFile, mkdir, readdir, rm, stat, unlink, writeFile } from 'fs/promises';
+import { copyFileWithFallback } from '../../common/utils/safe-copy.utils';
+import { access, mkdir, readdir, rm, stat, unlink, writeFile } from 'fs/promises';
 import { constants as fsConstants } from 'fs';
 import { isIP } from 'net';
 import { join } from 'path';
@@ -149,11 +150,11 @@ export class AuthorImageStorageService {
       await unlink(join(targetDir, file)).catch(() => {});
     }
 
-    await copyFile(join(sourceDir, photoFile), join(targetDir, photoFile));
+    await copyFileWithFallback(join(sourceDir, photoFile), join(targetDir, photoFile));
     const thumbSource = join(sourceDir, 'thumbnail.jpg');
     const thumbTarget = join(targetDir, 'thumbnail.jpg');
     if (await this.isReadable(thumbSource)) {
-      await copyFile(thumbSource, thumbTarget);
+      await copyFileWithFallback(thumbSource, thumbTarget);
     }
 
     return true;

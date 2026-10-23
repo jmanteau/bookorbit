@@ -1,12 +1,13 @@
 import { createHash } from 'crypto';
 import { createReadStream, createWriteStream } from 'fs';
-import { copyFile, mkdir, open, readdir, rename as fsRename, rmdir, stat, unlink } from 'fs/promises';
+import { mkdir, open, readdir, rename as fsRename, rmdir, stat, unlink } from 'fs/promises';
 import { dirname, isAbsolute, join, normalize, relative, sep } from 'path';
 import { pipeline } from 'stream/promises';
 
 import { DEFAULT_FORMAT_PRIORITY } from '@bookorbit/types';
 
 import { selectPrimaryFileKeepingCurrent } from '../../common/utils/primary-file-selection.utils';
+import { copyFileWithFallback } from '../../common/utils/safe-copy.utils';
 
 export const MAX_PATH_LENGTH = 4096;
 
@@ -139,7 +140,7 @@ export async function moveFileBack(from: string, to: string): Promise<void> {
   } catch (error) {
     if (!isCrossDeviceError(error)) throw error;
   }
-  await copyFile(from, to);
+  await copyFileWithFallback(from, to);
   await unlink(from);
 }
 

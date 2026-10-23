@@ -10,7 +10,7 @@ import {
   type CoverMedium,
 } from '@bookorbit/types';
 import { randomUUID } from 'crypto';
-import { access, copyFile, cp, link, mkdir, readFile, readdir, rename, rm, stat, writeFile } from 'fs/promises';
+import { access, cp, link, mkdir, readFile, readdir, rename, rm, stat, writeFile } from 'fs/promises';
 import { basename, join } from 'path';
 import sharp from 'sharp';
 
@@ -26,6 +26,7 @@ import {
   isExtractedBookCoverFileName,
 } from '../../common/book-cover-storage';
 import { sanitizeLogValue } from '../../common/utils/log-sanitize.utils';
+import { copyFileWithFallback } from '../../common/utils/safe-copy.utils';
 import { generateThumbnail, imageExt, normalizeProgressiveJpeg } from '../metadata/lib/cover';
 import { BookCoverEventsService } from './book-cover-events.service';
 import { classifyCoverShape } from './cover-shape';
@@ -741,7 +742,7 @@ export class BookCoverStore {
     try {
       await link(source, destination);
     } catch {
-      await copyFile(source, destination);
+      await copyFileWithFallback(source, destination);
     }
   }
 

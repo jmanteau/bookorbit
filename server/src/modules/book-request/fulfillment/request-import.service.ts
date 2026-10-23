@@ -3,12 +3,12 @@ import { ConfigService } from '@nestjs/config';
 import { AuditAction, AuditResource, UNSETTLED_BOOK_REQUEST_DOWNLOAD_STATUSES, WORKER_WRITABLE_BOOK_REQUEST_STATUSES } from '@bookorbit/types';
 import type { ReleaseUnitChoice } from '@bookorbit/types';
 import { randomUUID } from 'crypto';
-import { constants } from 'fs';
-import { copyFile, link, mkdir, readdir, realpath, rmdir, stat, unlink } from 'fs/promises';
+import { link, mkdir, readdir, realpath, rmdir, stat, unlink } from 'fs/promises';
 import { basename, dirname, extname, join, relative, sep } from 'path';
 
 import { isUniqueViolation } from '../../../common/utils/db-error.utils';
 import { sanitizeLogValue } from '../../../common/utils/log-sanitize.utils';
+import { copyFileWithFallback } from '../../../common/utils/safe-copy.utils';
 import type { BookRequestDownloadRow, BookRequestRow } from '../../../db/schema';
 import type { FileRole } from '../../scanner/lib/classify';
 import { AuditService } from '../../audit/audit.service';
@@ -661,7 +661,7 @@ export class RequestImportService implements OnApplicationBootstrap {
 
     // Exclusive, like the hardlink above it: a plain copy overwrites, so a destination that was
     // free when it was named and taken by the time it is written would be silently clobbered.
-    await copyFile(sourceFile, destPath, constants.COPYFILE_EXCL);
+    await copyFileWithFallback(sourceFile, destPath, { exclusive: true });
   }
 }
 
