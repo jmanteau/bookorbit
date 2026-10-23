@@ -1,48 +1,58 @@
-vi.mock('fs/promises', () => ({ readFile: vi.fn() }));
-vi.mock('node-unrar-js', () => ({ createExtractorFromData: vi.fn() }));
+import { mkdir, mkdtemp, rm, writeFile } from 'fs/promises';
+import { tmpdir } from 'os';
+import { join } from 'path';
 
-import { readFile } from 'fs/promises';
-import { createExtractorFromData } from 'node-unrar-js';
-
+import { buildRar5StoreArchive } from '../../../../test/helpers/rar5-store.fixture';
 import { extractCbrCover } from './cover-cbr';
 
-const mockReadFile = readFile as MockedFunction<typeof readFile>;
-const mockCreateExtractor = createExtractorFromData as MockedFunction<typeof createExtractorFromData>;
-
 describe('extractCbrCover', () => {
-  beforeEach(() => {
-    vi.resetAllMocks();
-    mockReadFile.mockResolvedValue(Buffer.from('rar-bytes') as unknown as Awaited<ReturnType<typeof readFile>>);
+  let root: string;
+
+  beforeEach(async () => {
+    root = await mkdtemp(join(tmpdir(), 'cover-cbr-test-'));
   });
 
-  it('picks naturally-sorted first visible image and extracts only that file', async () => {
-    mockCreateExtractor
-      .mockResolvedValueOnce({
-        getFileList: () => ({
-          fileHeaders: [
-            { name: '10.jpg', flags: { directory: false } },
-            { name: '2.jpg', flags: { directory: false } },
-            { name: '.hidden.jpg', flags: { directory: false } },
-          ],
-        }),
-      } as any)
-      .mockResolvedValueOnce({
-        extract: () => ({ files: [{ fileHeader: { flags: { directory: false } }, extraction: Uint8Array.from([7, 7, 7]) }] }),
-      } as any);
+  afterEach(async () => {
+    await rm(root, { recursive: true, force: true });
+  });
 
-    await expect(extractCbrCover('/book.cbr')).resolves.toEqual(Buffer.from([7, 7, 7]));
+  async function writeArchive(entries: { name: string; data: Buffer }[], dir = root, file = 'book.cbr'): Promise<string> {
+    await mkdir(dir, { recursive: true });
+    const path = join(dir, file);
+    await writeFile(path, buildRar5StoreArchive(entries));
+    return path;
+  }
+
+  it('picks naturally-sorted first visible image and extracts only that file', async () => {
+    const path = await writeArchive([
+      { name: '10.jpg', data: Buffer.from([10, 10]) },
+      { name: '2.jpg', data: Buffer.from([7, 7, 7]) },
+      { name: '.hidden.jpg', data: Buffer.from([1]) },
+    ]);
+
+    await expect(extractCbrCover(path)).resolves.toEqual(Buffer.from([7, 7, 7]));
   });
 
   it('returns null when archive has no visible image files', async () => {
-    mockCreateExtractor.mockResolvedValue({
-      getFileList: () => ({ fileHeaders: [{ name: 'notes.txt', flags: { directory: false } }] }),
-    } as any);
+    const path = await writeArchive([{ name: 'notes.txt', data: Buffer.from('hi') }]);
 
-    await expect(extractCbrCover('/book.cbr')).resolves.toBeNull();
+    await expect(extractCbrCover(path)).resolves.toBeNull();
   });
 
-  it('returns null when extraction errors', async () => {
-    mockCreateExtractor.mockRejectedValue(new Error('bad rar'));
-    await expect(extractCbrCover('/book.cbr')).resolves.toBeNull();
+  it('returns null for a corrupt file', async () => {
+    const path = join(root, 'corrupt.cbr');
+    await writeFile(path, Buffer.from('not a rar archive at all'));
+
+    await expect(extractCbrCover(path)).resolves.toBeNull();
+  });
+
+  it('returns null for a missing file', async () => {
+    await expect(extractCbrCover(join(root, 'missing.cbr'))).resolves.toBeNull();
+  });
+
+  it('reads from a path with spaces and unicode', async () => {
+    const path = await writeArchive([{ name: '1.jpg', data: Buffer.from([4, 2]) }], join(root, 'Série Ünï'), 'Tome 01 - été.cbr');
+
+    await expect(extractCbrCover(path)).resolves.toEqual(Buffer.from([4, 2]));
   });
 });

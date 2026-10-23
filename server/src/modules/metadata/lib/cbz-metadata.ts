@@ -1,8 +1,8 @@
 import { readFile } from 'fs/promises';
 import { XMLParser } from 'fast-xml-parser';
-import { createExtractorFromData, UnrarError } from 'node-unrar-js';
 import { parseSeriesIndex } from '@bookorbit/types';
 import { extractCbzZipEntry, isSupportedCbzZipCompression, readCbzZipIndex } from '../../../common/cbz-zip-reader';
+import { extractRarEntry } from '../../../common/rar-file-reader';
 import { getSevenZip } from '../../../common/sevenzip';
 import { parsePublishedDateKey, parsePublishedYear } from '../../../common/utils/published-date.utils';
 import { normalizeSeriesTotalBooks } from '../../../common/utils/series-total-books.utils';
@@ -310,10 +310,6 @@ function parseComicBookInfoJson(comment: string): ParsedCbzMetadata | null {
 
 // ── Public API ────────────────────────────────────────────────────────────────
 
-function toArrayBuffer(buf: Buffer): ArrayBuffer {
-  return buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength) as ArrayBuffer;
-}
-
 /**
  * Extract metadata from a CBZ file.
  * Tries ComicInfo.xml first (embedded file), then ComicBookInfo JSON (ZIP comment).
@@ -346,23 +342,7 @@ export async function extractCbzMetadata(absolutePath: string): Promise<ParsedCb
 /** Extract ComicInfo.xml metadata from a CBR (RAR) file. */
 export async function extractCbrMetadata(absolutePath: string): Promise<ParsedCbzMetadata | null> {
   try {
-    const buf = await readFile(absolutePath);
-    const ab = toArrayBuffer(buf);
-
-    const extractor = await createExtractorFromData({ data: ab });
-    const { files } = extractor.extract({ files: (h) => h.name.toLowerCase() === 'comicinfo.xml' });
-
-    let xmlBuf: Buffer | undefined;
-    try {
-      for (const file of files) {
-        if (!file.fileHeader.flags.directory && file.extraction) xmlBuf = Buffer.from(file.extraction);
-      }
-    } catch (err) {
-      // Some RAR 1.5 archives throw ERAR_BAD_DATA at the end-of-archive marker.
-      // If we already extracted the file we needed, use it.
-      if (!(err instanceof UnrarError)) throw err;
-    }
-
+    const xmlBuf = await extractRarEntry(absolutePath, (h) => h.name.toLowerCase() === 'comicinfo.xml');
     return xmlBuf ? parseComicInfoXml(xmlBuf) : null;
   } catch {
     return null;

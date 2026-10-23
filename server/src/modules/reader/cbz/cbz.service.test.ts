@@ -4,18 +4,11 @@ vi.mock('zlib', async () => {
   const actual = await vi.importActual<typeof import('zlib')>('zlib');
   return { ...actual, createInflateRaw: vi.fn() };
 });
-vi.mock('node-unrar-js', () => {
-  class MockUnrarError extends Error {
-    reason: string;
-
-    constructor(message = 'unrar error', reason = 'ERAR_BAD_ARCHIVE') {
-      super(message);
-      this.reason = reason;
-    }
-  }
-
-  return { createExtractorFromData: vi.fn(), UnrarError: MockUnrarError };
-});
+vi.mock('../../../common/rar-file-reader', () => ({
+  listRarEntries: vi.fn(),
+  extractRarEntry: vi.fn(),
+  isUnrarError: (err: unknown) => err instanceof Error && typeof (err as Error & { reason?: unknown }).reason === 'string',
+}));
 vi.mock('../../../common/sevenzip', () => ({ getSevenZip: vi.fn(), createSevenZipTempId: vi.fn() }));
 vi.mock('../../../common/comic-format-detect', () => ({
   detectComicContainerFormat: vi.fn().mockImplementation((_path: string, fmt: string) => Promise.resolve(fmt)),
@@ -24,9 +17,9 @@ vi.mock('../../../common/comic-format-detect', () => ({
 import { NotFoundException, UnprocessableEntityException } from '@nestjs/common';
 import { createReadStream } from 'fs';
 import { open, readFile, stat } from 'fs/promises';
-import { createExtractorFromData } from 'node-unrar-js';
 import { createInflateRaw, deflateRawSync } from 'zlib';
 
+import { extractRarEntry, listRarEntries } from '../../../common/rar-file-reader';
 import { createSevenZipTempId, getSevenZip } from '../../../common/sevenzip';
 import { detectComicContainerFormat } from '../../../common/comic-format-detect';
 import { CbzService, matchesIfNoneMatch, type ComicPageResult } from './cbz.service';
@@ -38,7 +31,8 @@ const mockCreateSevenZipTempId = createSevenZipTempId as MockedFunction<typeof c
 const mockOpen = open as MockedFunction<typeof open>;
 const mockCreateReadStream = createReadStream as unknown as MockedFunction<typeof createReadStream>;
 const mockCreateInflateRaw = createInflateRaw as unknown as MockedFunction<typeof createInflateRaw>;
-const mockCreateExtractorFromData = createExtractorFromData as MockedFunction<typeof createExtractorFromData>;
+const mockListRarEntries = listRarEntries as MockedFunction<typeof listRarEntries>;
+const mockExtractRarEntry = extractRarEntry as MockedFunction<typeof extractRarEntry>;
 const mockGetSevenZip = getSevenZip as MockedFunction<typeof getSevenZip>;
 const mockDetectComicContainerFormat = detectComicContainerFormat as MockedFunction<typeof detectComicContainerFormat>;
 
@@ -233,56 +227,46 @@ describe('CbzService', () => {
   });
 
   it('counts CBR pages and streams extracted data', async () => {
-    const rarBytes = Buffer.from('rar-bytes');
     bookService.verifyFileAccess.mockResolvedValue({ format: 'cbr', absolutePath: '/books/six.cbr' });
-    mockReadFile.mockResolvedValue(rarBytes as unknown as Awaited<ReturnType<typeof readFile>>);
-    mockCreateExtractorFromData
-      .mockResolvedValueOnce({
-        getFileList: () => ({
-          fileHeaders: [
-            { name: '10.jpg', flags: { directory: false } },
-            { name: '2.jpg', flags: { directory: false } },
-            { name: 'notes.txt', flags: { directory: false } },
-            { name: '.hidden.jpg', flags: { directory: false } },
-          ],
-        }),
-      } as any)
-      .mockResolvedValueOnce({
-        extract: () => ({
-          files: [{ fileHeader: { flags: { directory: false } }, extraction: Uint8Array.from([7, 8, 9]) }],
-        }),
-      } as any);
+    mockListRarEntries.mockResolvedValue(['10.jpg', '2.jpg']);
+    mockExtractRarEntry.mockResolvedValue(Buffer.from([7, 8, 9]));
 
     await expect(service.getPageCount(6, user)).resolves.toBe(2);
     const streamed = served(await service.streamPage(6, 0, user));
     await expect(readStream(streamed.stream)).resolves.toEqual(Buffer.from([7, 8, 9]));
     expect(streamed.mimeType).toBe('image/jpeg');
+    expect(mockExtractRarEntry).toHaveBeenCalledWith('/books/six.cbr', ['2.jpg']);
     await expect(service.getPageCount(6, user)).resolves.toBe(2);
-    expect(mockReadFile).toHaveBeenCalledTimes(1);
+    expect(mockListRarEntries).toHaveBeenCalledTimes(1);
+    expect(mockReadFile).not.toHaveBeenCalled();
+  });
+
+  it('filters CBR entries to visible images', async () => {
+    bookService.verifyFileAccess.mockResolvedValue({ format: 'cbr', absolutePath: '/books/filter.cbr' });
+    mockListRarEntries.mockResolvedValue([]);
+
+    await service.getPageCount(30, user);
+
+    const accept = mockListRarEntries.mock.calls[0][1];
+    const header = (name: string) => ({ name }) as Parameters<typeof accept>[0];
+    expect(accept(header('2.JPG'))).toBe(true);
+    expect(accept(header('ch1/3.png'))).toBe(true);
+    expect(accept(header('notes.txt'))).toBe(false);
+    expect(accept(header('.hidden.jpg'))).toBe(false);
+    expect(accept(header('.thumbs/1.jpg'))).toBe(false);
   });
 
   it('throws when CBR extraction does not produce the requested file', async () => {
     bookService.verifyFileAccess.mockResolvedValue({ format: 'cbr', absolutePath: '/books/seven.cbr' });
-    mockReadFile.mockResolvedValue(Buffer.from('rar') as unknown as Awaited<ReturnType<typeof readFile>>);
-    mockCreateExtractorFromData
-      .mockResolvedValueOnce({
-        getFileList: () => ({ fileHeaders: [{ name: '1.jpg', flags: { directory: false } }] }),
-      } as any)
-      .mockResolvedValueOnce({
-        extract: () => ({ files: [{ fileHeader: { flags: { directory: true } }, extraction: Uint8Array.from([1]) }] }),
-      } as any);
+    mockListRarEntries.mockResolvedValue(['1.jpg']);
+    mockExtractRarEntry.mockResolvedValue(null);
 
     await expect(service.streamPage(7, 0, user)).rejects.toThrow(NotFoundException);
   });
 
   it('wraps invalid CBR archive list errors as unprocessable archives', async () => {
     bookService.verifyFileAccess.mockResolvedValue({ format: 'cbr', absolutePath: '/books/bad.cbr' });
-    mockReadFile.mockResolvedValue(Buffer.from('not-rar') as unknown as Awaited<ReturnType<typeof readFile>>);
-    mockCreateExtractorFromData.mockResolvedValueOnce({
-      getFileList: () => {
-        throw Object.assign(new Error('File is not RAR archive'), { reason: 'ERAR_BAD_ARCHIVE' });
-      },
-    } as any);
+    mockListRarEntries.mockRejectedValue(Object.assign(new Error('File is not RAR archive'), { reason: 'ERAR_BAD_ARCHIVE' }));
 
     let error: unknown;
     try {
@@ -295,18 +279,17 @@ describe('CbzService', () => {
     expect((error as Error).message).toBe('CBR archive is unreadable: File is not RAR archive');
   });
 
+  it('rethrows non-unrar CBR list errors unchanged', async () => {
+    bookService.verifyFileAccess.mockResolvedValue({ format: 'cbr', absolutePath: '/books/io.cbr' });
+    mockListRarEntries.mockRejectedValue(new Error('EIO'));
+
+    await expect(service.getPageCount(31, user)).rejects.toThrow('EIO');
+  });
+
   it('wraps invalid CBR page extraction errors as unprocessable pages', async () => {
     bookService.verifyFileAccess.mockResolvedValue({ format: 'cbr', absolutePath: '/books/bad-page.cbr' });
-    mockReadFile.mockResolvedValue(Buffer.from('rar') as unknown as Awaited<ReturnType<typeof readFile>>);
-    mockCreateExtractorFromData
-      .mockResolvedValueOnce({
-        getFileList: () => ({ fileHeaders: [{ name: '1.jpg', flags: { directory: false } }] }),
-      } as any)
-      .mockResolvedValueOnce({
-        extract: () => {
-          throw Object.assign(new Error('corrupt page'), { reason: 'ERAR_BAD_DATA' });
-        },
-      } as any);
+    mockListRarEntries.mockResolvedValue(['1.jpg']);
+    mockExtractRarEntry.mockRejectedValue(Object.assign(new Error('corrupt page'), { reason: 'ERAR_BAD_DATA' }));
 
     let error: unknown;
     try {
@@ -321,12 +304,11 @@ describe('CbzService', () => {
 
   it('throws for CBR page indexes outside bounds', async () => {
     bookService.verifyFileAccess.mockResolvedValue({ format: 'cbr', absolutePath: '/books/seven.cbr' });
-    mockReadFile.mockResolvedValue(Buffer.from('rar') as unknown as Awaited<ReturnType<typeof readFile>>);
-    mockCreateExtractorFromData.mockResolvedValueOnce({
-      getFileList: () => ({ fileHeaders: [{ name: '1.jpg', flags: { directory: false } }] }),
-    } as any);
+    mockListRarEntries.mockResolvedValue(['1.jpg']);
 
     await expect(service.streamPage(7, 1, user)).rejects.toThrow(NotFoundException);
+    await expect(service.streamPage(7, -1, user)).rejects.toThrow(NotFoundException);
+    expect(mockExtractRarEntry).not.toHaveBeenCalled();
   });
 
   it('extracts CB7 pages once with folders kept, reuses the page list and drops the archive copy', async () => {
@@ -393,16 +375,9 @@ describe('CbzService', () => {
 
   it('reads a CBZ-stored-as-RAR using the CBR reader when magic bytes detect RAR', async () => {
     mockDetectComicContainerFormat.mockResolvedValue('cbr');
-    const rarBytes = Buffer.from('fake-rar');
     bookService.verifyFileAccess.mockResolvedValue({ format: 'cbz', absolutePath: '/books/mislabelled.cbz' });
-    mockReadFile.mockResolvedValue(rarBytes as unknown as Awaited<ReturnType<typeof readFile>>);
-    mockCreateExtractorFromData
-      .mockResolvedValueOnce({
-        getFileList: () => ({ fileHeaders: [{ name: '1.jpg', flags: { directory: false } }] }),
-      } as any)
-      .mockResolvedValueOnce({
-        extract: () => ({ files: [{ fileHeader: { flags: { directory: false } }, extraction: Uint8Array.from([1, 2, 3]) }] }),
-      } as any);
+    mockListRarEntries.mockResolvedValue(['1.jpg']);
+    mockExtractRarEntry.mockResolvedValue(Buffer.from([1, 2, 3]));
 
     await expect(service.getPageCount(10, user)).resolves.toBe(1);
     const result = served(await service.streamPage(10, 0, user));
@@ -458,22 +433,12 @@ describe('CbzService', () => {
 
     it('treats a size change with the same mtime as a new version of a CBR', async () => {
       bookService.verifyFileAccess.mockResolvedValue({ format: 'cbr', absolutePath: '/books/resized.cbr' });
-      mockReadFile.mockResolvedValue(Buffer.from('rar') as unknown as Awaited<ReturnType<typeof readFile>>);
-      mockCreateExtractorFromData
-        .mockResolvedValueOnce({ getFileList: () => ({ fileHeaders: [{ name: '1.jpg', flags: { directory: false } }] }) } as any)
-        .mockResolvedValueOnce({
-          getFileList: () => ({
-            fileHeaders: [
-              { name: '1.jpg', flags: { directory: false } },
-              { name: '2.jpg', flags: { directory: false } },
-            ],
-          }),
-        } as any);
+      mockListRarEntries.mockResolvedValueOnce(['1.jpg']).mockResolvedValueOnce(['1.jpg', '2.jpg']);
 
       await expect(service.getPageCount(21, user)).resolves.toBe(1);
       mockStat.mockResolvedValue(fileStats(1_000, 250));
       await expect(service.getPageCount(21, user)).resolves.toBe(2);
-      expect(mockReadFile).toHaveBeenCalledTimes(2);
+      expect(mockListRarEntries).toHaveBeenCalledTimes(2);
     });
 
     it('drops the previous CB7 extraction and serves pages from the new one', async () => {
@@ -525,19 +490,8 @@ describe('CbzService', () => {
   describe('page validators', () => {
     beforeEach(() => {
       bookService.verifyFileAccess.mockResolvedValue({ format: 'cbr', absolutePath: '/books/validated.cbr' });
-      mockReadFile.mockResolvedValue(Buffer.from('rar') as unknown as Awaited<ReturnType<typeof readFile>>);
-      mockCreateExtractorFromData.mockImplementation(
-        () =>
-          Promise.resolve({
-            getFileList: () => ({
-              fileHeaders: [
-                { name: '1.jpg', flags: { directory: false } },
-                { name: '2.jpg', flags: { directory: false } },
-              ],
-            }),
-            extract: () => ({ files: [{ fileHeader: { flags: { directory: false } }, extraction: Uint8Array.from([1]) }] }),
-          }) as any,
-      );
+      mockListRarEntries.mockResolvedValue(['1.jpg', '2.jpg']);
+      mockExtractRarEntry.mockResolvedValue(Buffer.from([1]));
     });
 
     it('gives each page of each file version its own ETag', async () => {
@@ -555,11 +509,11 @@ describe('CbzService', () => {
 
     it('answers notModified without extracting the page when the client already holds it', async () => {
       const { etag } = await service.streamPage(26, 1, user);
-      const extractionsBefore = mockCreateExtractorFromData.mock.calls.length;
+      const extractionsBefore = mockExtractRarEntry.mock.calls.length;
 
       await expect(service.streamPage(26, 1, user, etag)).resolves.toEqual({ notModified: true, etag });
       await expect(service.streamPage(26, 1, user, `"something-else", W/${etag}`)).resolves.toEqual({ notModified: true, etag });
-      expect(mockCreateExtractorFromData).toHaveBeenCalledTimes(extractionsBefore);
+      expect(mockExtractRarEntry).toHaveBeenCalledTimes(extractionsBefore);
       expect(bookService.verifyFileAccess).toHaveBeenCalledTimes(3);
     });
 

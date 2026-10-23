@@ -2,10 +2,10 @@ import { Injectable, NotFoundException, UnprocessableEntityException } from '@ne
 import { createHash } from 'crypto';
 import { Readable } from 'stream';
 import { readFile, stat } from 'fs/promises';
-import { createExtractorFromData, UnrarError } from 'node-unrar-js';
 import { createSevenZipTempId, getSevenZip } from '../../../common/sevenzip';
 import { imageContentTypeFromPath } from '../../../common/image-content-type';
 import { detectComicContainerFormat } from '../../../common/comic-format-detect';
+import { extractRarEntry, isUnrarError, listRarEntries } from '../../../common/rar-file-reader';
 import { createCbzZipEntryReadStream, readCbzZipIndex, type CbzZipEntry } from '../../../common/cbz-zip-reader';
 import { compareComicPagePaths, listExtractedFiles, pathBasename, removeExtractedTree } from './cb7-extraction';
 
@@ -35,24 +35,12 @@ function mimeForExt(name: string): string {
 
 // ── CBR: node-unrar-js ─────────────────────────────────────────────────────────
 
-function isUnrarError(err: unknown): err is Error {
-  if (typeof UnrarError === 'function' && err instanceof UnrarError) return true;
-  if (!(err instanceof Error)) return false;
-  const reason = (err as Error & { reason?: unknown }).reason;
-  return typeof reason === 'string' && reason.startsWith('ERAR_');
-}
-
 function unreadableCbrArchive(err: Error): UnprocessableEntityException {
   return new UnprocessableEntityException(`CBR archive is unreadable: ${err.message}`);
 }
 
 function unreadableCbrPage(err: Error): UnprocessableEntityException {
   return new UnprocessableEntityException(`CBR page is unreadable: ${err.message}`);
-}
-
-// Buffer.buffer is a shared pool; slice out only the bytes for this buffer.
-function toArrayBuffer(buf: Buffer): ArrayBuffer {
-  return buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength) as ArrayBuffer;
 }
 
 // ── Freshness ──────────────────────────────────────────────────────────────────
@@ -95,7 +83,6 @@ export function matchesIfNoneMatch(header: string | undefined, etag: string): bo
 // ── Service ────────────────────────────────────────────────────────────────────
 
 interface RarCache {
-  buffer: ArrayBuffer;
   pages: string[];
 }
 
@@ -119,7 +106,7 @@ interface OpenedComic {
 export class CbzService {
   // CBZ: byte-offset index per fileId
   private readonly zipIndex = new Map<number, Stamped<CbzZipEntry[]>>();
-  // CBR: archive ArrayBuffer + sorted page names per fileId
+  // CBR: sorted page names per fileId
   private readonly rarCache = new Map<number, Stamped<RarCache>>();
   // CB7: extracted folder + sorted page paths per fileId (extracted files live in WASM VFS)
   private readonly sevenZPages = new Map<number, Stamped<SevenZipPages>>();
@@ -200,52 +187,33 @@ export class CbzService {
     const cached = this.rarCache.get(fileId);
     if (cached && sameStamp(cached.stamp, stamp)) return cached.value;
 
-    const buf = await readFile(filePath);
-    const ab = toArrayBuffer(buf);
-
-    const pages: string[] = [];
+    let pages: string[];
     try {
-      const extractor = await createExtractorFromData({ data: ab });
-      const { fileHeaders } = extractor.getFileList();
-      for (const h of fileHeaders) {
-        if (!h.flags.directory && isImage(h.name) && !isHidden(h.name)) {
-          pages.push(h.name);
-        }
-      }
+      pages = await listRarEntries(filePath, (h) => isImage(h.name) && !isHidden(h.name));
     } catch (err) {
-      // Some RAR 1.5 archives throw ERAR_BAD_DATA at the end-of-archive
-      // marker instead of returning ERAR_END_ARCHIVE. If we already have
-      // pages, the archive is readable - accept the partial list.
-      if (!isUnrarError(err) || pages.length === 0) {
-        throw isUnrarError(err) ? unreadableCbrArchive(err) : err;
-      }
+      throw isUnrarError(err) ? unreadableCbrArchive(err) : err;
     }
 
     pages.sort(naturalSort);
-    const value = { buffer: ab, pages };
+    const value = { pages };
     this.rarCache.set(fileId, { stamp, value });
     return value;
   }
 
-  private async extractRarPage(buffer: ArrayBuffer, pageName: string): Promise<Uint8Array> {
-    // Generators MUST be fully drained to avoid WASM memory leak
-    let result: Uint8Array | undefined;
+  private async extractRarPage(filePath: string, pageName: string): Promise<Buffer> {
+    let data: Buffer | null;
     try {
-      const extractor = await createExtractorFromData({ data: buffer });
       // Pass an array so the extractor stops after the first match and never
       // hits the malformed end-of-archive marker present in some RAR 1.5 files.
-      const { files } = extractor.extract({ files: [pageName] });
-      for (const file of files) {
-        if (!file.fileHeader.flags.directory) result = file.extraction;
-      }
+      data = await extractRarEntry(filePath, [pageName]);
     } catch (err) {
       if (isUnrarError(err)) {
         throw unreadableCbrPage(err);
       }
       throw err;
     }
-    if (result === undefined) throw new NotFoundException(`Page not found in RAR archive`);
-    return result;
+    if (data === null) throw new NotFoundException(`Page not found in RAR archive`);
+    return data;
   }
 
   // ── CB7 ──────────────────────────────────────────────────────────────────────
@@ -327,12 +295,12 @@ export class CbzService {
     }
 
     if (comic.format === 'cbr') {
-      const { buffer, pages } = await this.getRarCache(fileId, comic.absolutePath, comic.stamp);
+      const { pages } = await this.getRarCache(fileId, comic.absolutePath, comic.stamp);
       if (pageIndex < 0 || pageIndex >= pages.length) {
         throw new NotFoundException(`Page ${pageIndex} out of range`);
       }
-      const data = await this.extractRarPage(buffer, pages[pageIndex]);
-      return { notModified: false, etag, stream: Readable.from(Buffer.from(data)), mimeType: mimeForExt(pages[pageIndex]) };
+      const data = await this.extractRarPage(comic.absolutePath, pages[pageIndex]);
+      return { notModified: false, etag, stream: Readable.from(data), mimeType: mimeForExt(pages[pageIndex]) };
     }
 
     const sz = await getSevenZip();
