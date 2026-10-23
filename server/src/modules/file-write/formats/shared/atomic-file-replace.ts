@@ -37,15 +37,24 @@ async function carryOverAttributes(tempPath: string, targetPath: string): Promis
   const original = await stat(targetPath).catch(() => null);
   if (!original) return;
 
-  await chmod(tempPath, original.mode & 0o7777);
+  try {
+    await chmod(tempPath, original.mode & 0o7777);
+  } catch (error) {
+    // NFS root_squash and ACL-backed shares refuse chmod while allowing writes; the share's own mode applies.
+    if (!isUnsupportedAttributeChange(error)) throw error;
+  }
   const temp = await stat(tempPath);
   if (temp.uid === original.uid && temp.gid === original.gid) return;
   try {
     await chown(tempPath, original.uid, original.gid);
   } catch (error) {
     // Only a privileged process may give a file away; an unprivileged one keeps its own ownership.
-    if (!isErrnoCode(error, 'EPERM') && !isErrnoCode(error, 'ENOTSUP') && !isErrnoCode(error, 'EINVAL')) throw error;
+    if (!isUnsupportedAttributeChange(error)) throw error;
   }
+}
+
+function isUnsupportedAttributeChange(error: unknown): boolean {
+  return isErrnoCode(error, 'EPERM') || isErrnoCode(error, 'ENOTSUP') || isErrnoCode(error, 'EINVAL');
 }
 
 function isErrnoCode(error: unknown, code: string): error is NodeJS.ErrnoException {

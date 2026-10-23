@@ -1,8 +1,20 @@
 import { link, mkdtemp, readFile, rm, stat, writeFile, chmod } from 'fs/promises';
+import * as fsPromises from 'fs/promises';
 import { tmpdir } from 'os';
 import { join } from 'path';
 
 import { replaceFileAtomically } from './atomic-file-replace';
+
+vi.mock('fs/promises', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('fs/promises')>();
+  return { ...actual, chmod: vi.fn(actual.chmod) };
+});
+
+function errnoError(code: string): NodeJS.ErrnoException {
+  const error: NodeJS.ErrnoException = new Error(`${code}: refused, chmod`);
+  error.code = code;
+  return error;
+}
 
 describe('replaceFileAtomically on a real filesystem', () => {
   let dir: string;
@@ -12,6 +24,7 @@ describe('replaceFileAtomically on a real filesystem', () => {
   });
 
   afterEach(async () => {
+    vi.mocked(fsPromises.chmod).mockClear();
     await rm(dir, { recursive: true, force: true });
   });
 
@@ -63,5 +76,29 @@ describe('replaceFileAtomically on a real filesystem', () => {
     await replaceFileAtomically(temp, target);
 
     expect(await readFile(target, 'utf8')).toBe('new');
+  });
+
+  it.each(['EPERM', 'ENOTSUP'])('replaces the file when the share refuses chmod with %s', async (code) => {
+    const target = join(dir, 'book.epub');
+    const temp = join(dir, '.epub-write-temp');
+    await writeFile(target, 'old');
+    await writeFile(temp, 'new');
+    vi.mocked(fsPromises.chmod).mockRejectedValueOnce(errnoError(code));
+
+    await replaceFileAtomically(temp, target);
+
+    expect(await readFile(target, 'utf8')).toBe('new');
+  });
+
+  it('still fails and keeps the original when chmod is denied for another reason', async () => {
+    const target = join(dir, 'book.epub');
+    const temp = join(dir, '.epub-write-temp');
+    await writeFile(target, 'old');
+    await writeFile(temp, 'new');
+    vi.mocked(fsPromises.chmod).mockRejectedValueOnce(errnoError('EACCES'));
+
+    await expect(replaceFileAtomically(temp, target)).rejects.toMatchObject({ code: 'EACCES' });
+    expect(await readFile(target, 'utf8')).toBe('old');
+    await expect(stat(temp)).rejects.toMatchObject({ code: 'ENOENT' });
   });
 });
