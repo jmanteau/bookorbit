@@ -2,6 +2,7 @@
 // The comic reader, metadata extraction and release archives all use this.
 
 import { randomUUID } from 'crypto';
+import { basename, dirname } from 'path';
 
 export interface SevenZipFS {
   open(path: string, flags: string): number;
@@ -21,10 +22,14 @@ export interface SevenZipFS {
   isLink(mode: number): boolean;
   unlink(path: string): void;
   rmdir(path: string): void;
+  mount(type: unknown, opts: { root: string }, mountpoint: string): unknown;
+  unmount(mountpoint: string): void;
 }
 
 export interface SevenZipModule {
   FS: SevenZipFS;
+  /** Emscripten's host-filesystem driver, the `type` for `FS.mount`. */
+  NODEFS: unknown;
   callMain(args: string[]): void;
 }
 
@@ -61,4 +66,34 @@ export async function getSevenZip(): Promise<SevenZipModule> {
  */
 export function createSevenZipTempId(prefix: string): string {
   return `${prefix}_${randomUUID()}`;
+}
+
+/**
+ * Lets 7-Zip read an archive straight from the host disk instead of a copy in the WASM heap, by
+ * mounting the archive's folder at a mountpoint of its own.
+ *
+ * Paths below the mountpoint are the user's real files: never unlink or write them through `FS`.
+ * `release` unmounts and removes the mountpoint; call it once, in a `finally`.
+ */
+export function mountHostArchive(sevenZip: SevenZipModule, absolutePath: string): { archivePath: string; release(): void } {
+  const mountpoint = `/${createSevenZipTempId('src')}`;
+  sevenZip.FS.mkdir(mountpoint);
+  try {
+    sevenZip.FS.mount(sevenZip.NODEFS, { root: dirname(absolutePath) }, mountpoint);
+  } catch (error) {
+    sevenZip.FS.rmdir(mountpoint);
+    throw error;
+  }
+
+  return {
+    archivePath: `${mountpoint}/${basename(absolutePath)}`,
+    release() {
+      try {
+        sevenZip.FS.unmount(mountpoint);
+        sevenZip.FS.rmdir(mountpoint);
+      } catch {
+        // already unmounted
+      }
+    },
+  };
 }

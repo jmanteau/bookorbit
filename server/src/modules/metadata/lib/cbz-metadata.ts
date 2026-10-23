@@ -1,9 +1,8 @@
-import { readFile } from 'fs/promises';
 import { XMLParser } from 'fast-xml-parser';
 import { parseSeriesIndex } from '@bookorbit/types';
 import { extractCbzZipEntry, isSupportedCbzZipCompression, readCbzZipIndex } from '../../../common/cbz-zip-reader';
 import { extractRarEntry } from '../../../common/rar-file-reader';
-import { getSevenZip } from '../../../common/sevenzip';
+import { getSevenZip, mountHostArchive } from '../../../common/sevenzip';
 import { parsePublishedDateKey, parsePublishedYear } from '../../../common/utils/published-date.utils';
 import { normalizeSeriesTotalBooks } from '../../../common/utils/series-total-books.utils';
 import { cleanupSevenZipArtifacts, createSevenZipTempId, type SevenZipInstance } from './sevenzip-vfs';
@@ -352,20 +351,14 @@ export async function extractCbrMetadata(absolutePath: string): Promise<ParsedCb
 /** Extract ComicInfo.xml metadata from a CB7 (7-Zip) file. */
 export async function extractCb7Metadata(absolutePath: string): Promise<ParsedCbzMetadata | null> {
   let sz: SevenZipInstance | null = null;
-  let archivePath: string | null = null;
+  let source: ReturnType<typeof mountHostArchive> | null = null;
   let outDir: string | null = null;
 
   try {
     sz = await getSevenZip();
-    const buf = await readFile(absolutePath);
+    source = mountHostArchive(sz, absolutePath);
 
-    const id = createSevenZipTempId('meta');
-    archivePath = `/${id}`;
-    outDir = `/${id}_out`;
-
-    const fd = sz.FS.open(archivePath, 'w+');
-    sz.FS.write(fd, buf, 0, buf.length);
-    sz.FS.close(fd);
+    outDir = `/${createSevenZipTempId('meta')}_out`;
 
     try {
       sz.FS.mkdir(outDir);
@@ -374,7 +367,7 @@ export async function extractCb7Metadata(absolutePath: string): Promise<ParsedCb
     }
 
     // Extract only ComicInfo.xml — avoids decompressing the whole solid block.
-    sz.callMain(['e', archivePath, `-o${outDir}`, 'ComicInfo.xml', '-y']);
+    sz.callMain(['e', source.archivePath, `-o${outDir}`, 'ComicInfo.xml', '-y']);
 
     let result: ParsedCbzMetadata | null = null;
     try {
@@ -388,8 +381,9 @@ export async function extractCb7Metadata(absolutePath: string): Promise<ParsedCb
   } catch {
     return null;
   } finally {
-    if (sz && archivePath && outDir) {
-      cleanupSevenZipArtifacts(sz, archivePath, outDir);
+    source?.release();
+    if (sz && outDir) {
+      cleanupSevenZipArtifacts(sz, outDir);
     }
   }
 }

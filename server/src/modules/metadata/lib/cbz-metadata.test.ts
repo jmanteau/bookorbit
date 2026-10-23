@@ -3,11 +3,12 @@ vi.mock('node-unrar-js');
 vi.mock('../../../common/sevenzip');
 
 import { open, readFile } from 'fs/promises';
-import { getSevenZip } from '../../../common/sevenzip';
+import { getSevenZip, mountHostArchive } from '../../../common/sevenzip';
 import { extractCb7Metadata, extractCbzMetadata } from './cbz-metadata';
 
 const mockOpen = open as MockedFunction<typeof open>;
 const mockReadFile = readFile as MockedFunction<typeof readFile>;
+const mockMountHostArchive = mountHostArchive as MockedFunction<typeof mountHostArchive>;
 const mockGetSevenZip = getSevenZip as MockedFunction<typeof getSevenZip>;
 
 // ── ZIP buffer builder ────────────────────────────────────────────────────────
@@ -476,16 +477,15 @@ describe('extractCbzMetadata', () => {
 });
 
 describe('extractCb7Metadata', () => {
+  const release = vi.fn();
+
   beforeEach(() => {
     vi.resetAllMocks();
-    mockReadFile.mockResolvedValue(Buffer.from('7z') as unknown as Buffer);
+    mockMountHostArchive.mockReturnValue({ archivePath: '/src_test/book.cb7', release });
   });
 
   it('parses ComicInfo.xml and cleans up wasm VFS artifacts', async () => {
     const fsApi = {
-      open: vi.fn().mockReturnValue(1),
-      write: vi.fn(),
-      close: vi.fn(),
       mkdir: vi.fn(),
       readFile: vi.fn().mockReturnValue(Uint8Array.from(Buffer.from('<ComicInfo><Title>CB7 Comic</Title></ComicInfo>'))),
       readdir: vi.fn().mockReturnValue(['.', '..', 'ComicInfo.xml']),
@@ -493,20 +493,21 @@ describe('extractCb7Metadata', () => {
       rmdir: vi.fn(),
     };
 
-    mockGetSevenZip.mockResolvedValue({ FS: fsApi, callMain: vi.fn() } as any);
+    const callMain = vi.fn();
+    mockGetSevenZip.mockResolvedValue({ FS: fsApi, callMain } as any);
 
     const result = await extractCb7Metadata('/book.cb7');
 
     expect(result?.title).toBe('CB7 Comic');
+    expect(mockMountHostArchive).toHaveBeenCalledWith(expect.anything(), '/book.cb7');
+    expect(callMain).toHaveBeenCalledWith(['e', '/src_test/book.cb7', expect.stringMatching(/^-o\//), 'ComicInfo.xml', '-y']);
+    expect(fsApi.unlink).not.toHaveBeenCalledWith('/src_test/book.cb7');
     expect(fsApi.rmdir).toHaveBeenCalled();
-    expect(fsApi.unlink).toHaveBeenCalled();
+    expect(release).toHaveBeenCalledTimes(1);
   });
 
   it('cleans up artifacts even when extraction command throws', async () => {
     const fsApi = {
-      open: vi.fn().mockReturnValue(1),
-      write: vi.fn(),
-      close: vi.fn(),
       mkdir: vi.fn(),
       readFile: vi.fn(),
       readdir: vi.fn().mockReturnValue(['.', '..']),
@@ -521,6 +522,6 @@ describe('extractCb7Metadata', () => {
 
     await expect(extractCb7Metadata('/book.cb7')).resolves.toBeNull();
     expect(fsApi.rmdir).toHaveBeenCalled();
-    expect(fsApi.unlink).toHaveBeenCalled();
+    expect(release).toHaveBeenCalledTimes(1);
   });
 });

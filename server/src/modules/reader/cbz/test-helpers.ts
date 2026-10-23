@@ -44,6 +44,8 @@ export class FakeSevenZip implements SevenZipModule {
 
   constructor(public archive: Record<string, FakeArchiveEntry> = {}) {}
 
+  readonly NODEFS = {};
+
   readonly FS: SevenZipFS = {
     open: (path) => {
       this.nodes.set(path, { mode: FILE_MODE, data: new Uint8Array() });
@@ -97,6 +99,8 @@ export class FakeSevenZip implements SevenZipModule {
       if (this.FS.readdir(path).length > 2) throw errno('ENOTEMPTY');
       this.nodes.delete(path);
     },
+    mount: () => undefined,
+    unmount: () => undefined,
   };
 
   callMain(args: string[]): void {

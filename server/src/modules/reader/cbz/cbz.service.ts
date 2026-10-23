@@ -1,8 +1,8 @@
 import { Injectable, NotFoundException, UnprocessableEntityException } from '@nestjs/common';
 import { createHash } from 'crypto';
 import { Readable } from 'stream';
-import { readFile, stat } from 'fs/promises';
-import { createSevenZipTempId, getSevenZip } from '../../../common/sevenzip';
+import { stat } from 'fs/promises';
+import { createSevenZipTempId, getSevenZip, mountHostArchive } from '../../../common/sevenzip';
 import { imageContentTypeFromPath } from '../../../common/image-content-type';
 import { detectComicContainerFormat } from '../../../common/comic-format-detect';
 import { extractRarEntry, isUnrarError, listRarEntries } from '../../../common/rar-file-reader';
@@ -223,32 +223,25 @@ export class CbzService {
     if (cached && sameStamp(cached.stamp, stamp)) return cached.value;
 
     const sz = await getSevenZip();
-    const buf = await readFile(filePath);
 
     // A folder per extraction, so a rebuild after the file changed never shares a tree with
     // requests still reading the previous one.
     const dir = `/${createSevenZipTempId(`comic${fileId}`)}`;
-    const archivePath = `${dir}.7z`;
 
+    let source: ReturnType<typeof mountHostArchive> | null = null;
     try {
-      const fd = sz.FS.open(archivePath, 'w+');
-      sz.FS.write(fd, buf, 0, buf.length);
-      sz.FS.close(fd);
+      source = mountHostArchive(sz, filePath);
       sz.FS.mkdir(dir);
 
       // callMain is synchronous - blocks the event loop while 7z extracts.
       // Acceptable for a local single-user server; revisit with worker_threads if needed.
       // `x` keeps folders: `e` flattened them, so two pages sharing a name overwrote each other.
-      sz.callMain(['x', archivePath, `-o${dir}`, '-y']);
+      sz.callMain(['x', source.archivePath, `-o${dir}`, '-y']);
     } catch (err) {
       removeExtractedTree(sz.FS, dir);
       throw err;
     } finally {
-      try {
-        sz.FS.unlink(archivePath);
-      } catch {
-        // never written
-      }
+      source?.release();
     }
 
     // Only the file name decides hidden, as it did when the archive was extracted flat.

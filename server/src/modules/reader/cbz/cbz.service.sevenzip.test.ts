@@ -1,8 +1,10 @@
-import { mkdtemp, rm, utimes, writeFile } from 'fs/promises';
+import { mkdir, mkdtemp, readFile, rm, utimes, writeFile } from 'fs/promises';
 import { join } from 'path';
 import { tmpdir } from 'os';
 
 import { createSevenZipTempId, getSevenZip } from '../../../common/sevenzip';
+import { extractCb7Metadata } from '../../metadata/lib/cbz-metadata';
+import { extractCb7Cover } from '../../metadata/lib/cover-cb7';
 import { CbzService, type ComicPageResult } from './cbz.service';
 
 /**
@@ -98,5 +100,54 @@ describe('CbzService CB7 pages against the real 7z module', () => {
     await utimes(path, new Date(), new Date(Date.now() + 60_000));
 
     await expect(pageTexts(service, 32)).resolves.toEqual(['rewritten']);
+  });
+
+  describe('reading the archive from the host disk', () => {
+    const comicInfo = '<ComicInfo><Title>Mounted</Title></ComicInfo>';
+
+    async function mountpoints(): Promise<string[]> {
+      return (await getSevenZip()).FS.readdir('/').filter((name) => name.startsWith('src_'));
+    }
+
+    async function writeComic(relativePath: string, bytes: Uint8Array): Promise<string> {
+      const path = join(workspace, relativePath);
+      await mkdir(join(path, '..'), { recursive: true });
+      await writeFile(path, bytes);
+      return path;
+    }
+
+    function serviceFor(path: string): CbzService {
+      return new CbzService({ verifyFileAccess: vi.fn().mockResolvedValue({ format: 'cb7', absolutePath: path }) } as any);
+    }
+
+    it('leaves the source file untouched and unmounts after the cover, metadata and reader reads', async () => {
+      const archive = await buildSevenZip({ '2.jpg': 'two', '1.jpg': 'one', 'ComicInfo.xml': comicInfo });
+      const path = await writeComic('Ünïcode dir/Lab #001 - spaces.cb7', archive);
+      const before = await readFile(path);
+
+      await expect(extractCb7Cover(path)).resolves.toEqual(Buffer.from('one'));
+      expect((await extractCb7Metadata(path))?.title).toBe('Mounted');
+      const service = serviceFor(path);
+      await expect(pageTexts(service, 41)).resolves.toEqual(['one', 'two']);
+
+      const after = await readFile(path);
+      expect(after.equals(before)).toBe(true);
+      expect(after.equals(Buffer.from(archive))).toBe(true);
+      await expect(mountpoints()).resolves.toEqual([]);
+    });
+
+    it('unmounts when the archive is corrupt, and still leaves the file alone', async () => {
+      const garbage = Buffer.from('this is not a 7z archive, just some text');
+      const path = await writeComic('broken.cb7', garbage);
+
+      await expect(extractCb7Cover(path)).resolves.toBeNull();
+      await expect(extractCb7Metadata(path)).resolves.toBeNull();
+      await serviceFor(path)
+        .getPageCount(42, user)
+        .catch(() => undefined);
+
+      expect((await readFile(path)).equals(garbage)).toBe(true);
+      await expect(mountpoints()).resolves.toEqual([]);
+    });
   });
 });

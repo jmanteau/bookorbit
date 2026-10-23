@@ -1,25 +1,25 @@
-vi.mock('fs/promises', () => ({ readFile: vi.fn() }));
-vi.mock('../../../common/sevenzip', () => ({ getSevenZip: vi.fn(), createSevenZipTempId: (prefix: string) => `${prefix}_test` }));
+vi.mock('../../../common/sevenzip', () => ({
+  getSevenZip: vi.fn(),
+  mountHostArchive: vi.fn(),
+  createSevenZipTempId: (prefix: string) => `${prefix}_test`,
+}));
 
-import { readFile } from 'fs/promises';
-
-import { getSevenZip } from '../../../common/sevenzip';
+import { getSevenZip, mountHostArchive } from '../../../common/sevenzip';
 import { extractCb7Cover } from './cover-cb7';
 
-const mockReadFile = readFile as MockedFunction<typeof readFile>;
+const mockMountHostArchive = mountHostArchive as MockedFunction<typeof mountHostArchive>;
 const mockGetSevenZip = getSevenZip as MockedFunction<typeof getSevenZip>;
 
 describe('extractCb7Cover', () => {
+  const release = vi.fn();
+
   beforeEach(() => {
     vi.resetAllMocks();
-    mockReadFile.mockResolvedValue(Buffer.from('7z') as unknown as Awaited<ReturnType<typeof readFile>>);
+    mockMountHostArchive.mockReturnValue({ archivePath: '/src_test/book.cb7', release });
   });
 
   it('extracts first natural-sorted image and cleans wasm VFS artifacts', async () => {
     const fsApi = {
-      open: vi.fn().mockReturnValue(1),
-      write: vi.fn(),
-      close: vi.fn(),
       mkdir: vi.fn(),
       readdir: vi.fn().mockReturnValue(['.', '..', '10.jpg', '2.jpg']),
       readFile: vi.fn().mockReturnValue(Uint8Array.from([1, 2, 3])),
@@ -27,18 +27,20 @@ describe('extractCb7Cover', () => {
       rmdir: vi.fn(),
     };
 
-    mockGetSevenZip.mockResolvedValue({ FS: fsApi, callMain: vi.fn() } as any);
+    const callMain = vi.fn();
+    mockGetSevenZip.mockResolvedValue({ FS: fsApi, callMain } as any);
 
     await expect(extractCb7Cover('/book.cb7')).resolves.toEqual(Buffer.from([1, 2, 3]));
-    expect(fsApi.unlink).toHaveBeenCalled();
+    expect(mockMountHostArchive).toHaveBeenCalledWith(expect.anything(), '/book.cb7');
+    expect(callMain).toHaveBeenCalledWith(['e', '/src_test/book.cb7', '-o/cover_test_out', '-y']);
+    expect(fsApi.unlink).toHaveBeenCalledTimes(2);
+    expect(fsApi.unlink).not.toHaveBeenCalledWith('/src_test/book.cb7');
     expect(fsApi.rmdir).toHaveBeenCalled();
+    expect(release).toHaveBeenCalledTimes(1);
   });
 
   it('returns null when extracted folder has no image files', async () => {
     const fsApi = {
-      open: vi.fn().mockReturnValue(1),
-      write: vi.fn(),
-      close: vi.fn(),
       mkdir: vi.fn(),
       readdir: vi.fn().mockReturnValue(['.', '..', 'notes.txt']),
       readFile: vi.fn(),
@@ -58,9 +60,6 @@ describe('extractCb7Cover', () => {
 
   it('cleans up VFS artifacts even when extraction command throws', async () => {
     const fsApi = {
-      open: vi.fn().mockReturnValue(1),
-      write: vi.fn(),
-      close: vi.fn(),
       mkdir: vi.fn(),
       readdir: vi.fn().mockReturnValue(['.', '..']),
       readFile: vi.fn(),
@@ -75,6 +74,6 @@ describe('extractCb7Cover', () => {
 
     await expect(extractCb7Cover('/book.cb7')).resolves.toBeNull();
     expect(fsApi.rmdir).toHaveBeenCalled();
-    expect(fsApi.unlink).toHaveBeenCalled();
+    expect(release).toHaveBeenCalledTimes(1);
   });
 });

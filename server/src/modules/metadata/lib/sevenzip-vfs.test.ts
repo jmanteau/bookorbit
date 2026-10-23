@@ -7,21 +7,21 @@ describe('sevenzip-vfs', () => {
     expect(id.length).toBeGreaterThan('cover_'.length);
   });
 
-  it('cleans extracted files, output directory, and archive path', () => {
+  it('cleans extracted files and the output directory', () => {
     const fsApi = {
       readdir: vi.fn().mockReturnValue(['.', '..', 'ComicInfo.xml']),
       unlink: vi.fn(),
       rmdir: vi.fn(),
     };
 
-    cleanupSevenZipArtifacts({ FS: fsApi } as any, '/archive.7z', '/out');
+    cleanupSevenZipArtifacts({ FS: fsApi } as any, '/out');
 
     expect(fsApi.unlink).toHaveBeenCalledWith('/out/ComicInfo.xml');
     expect(fsApi.rmdir).toHaveBeenCalledWith('/out');
-    expect(fsApi.unlink).toHaveBeenCalledWith('/archive.7z');
+    expect(fsApi.unlink).toHaveBeenCalledTimes(1);
   });
 
-  it('still tries deleting archive when output directory cleanup fails', () => {
+  it('never unlinks anything but the extracted files, so a mounted archive stays on disk', () => {
     const fsApi = {
       readdir: vi.fn().mockImplementation(() => {
         throw new Error('missing directory');
@@ -30,8 +30,8 @@ describe('sevenzip-vfs', () => {
       rmdir: vi.fn(),
     };
 
-    cleanupSevenZipArtifacts({ FS: fsApi } as any, '/archive.7z', '/out');
+    cleanupSevenZipArtifacts({ FS: fsApi } as any, '/out');
 
-    expect(fsApi.unlink).toHaveBeenCalledWith('/archive.7z');
+    expect(fsApi.unlink).not.toHaveBeenCalled();
   });
 });

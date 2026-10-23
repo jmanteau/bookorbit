@@ -9,18 +9,19 @@ vi.mock('../../../common/rar-file-reader', () => ({
   extractRarEntry: vi.fn(),
   isUnrarError: (err: unknown) => err instanceof Error && typeof (err as Error & { reason?: unknown }).reason === 'string',
 }));
-vi.mock('../../../common/sevenzip', () => ({ getSevenZip: vi.fn(), createSevenZipTempId: vi.fn() }));
+vi.mock('../../../common/sevenzip', () => ({ getSevenZip: vi.fn(), createSevenZipTempId: vi.fn(), mountHostArchive: vi.fn() }));
 vi.mock('../../../common/comic-format-detect', () => ({
   detectComicContainerFormat: vi.fn().mockImplementation((_path: string, fmt: string) => Promise.resolve(fmt)),
 }));
 
 import { NotFoundException, UnprocessableEntityException } from '@nestjs/common';
 import { createReadStream } from 'fs';
+import { basename } from 'path';
 import { open, readFile, stat } from 'fs/promises';
 import { createInflateRaw, deflateRawSync } from 'zlib';
 
 import { extractRarEntry, listRarEntries } from '../../../common/rar-file-reader';
-import { createSevenZipTempId, getSevenZip } from '../../../common/sevenzip';
+import { createSevenZipTempId, getSevenZip, mountHostArchive } from '../../../common/sevenzip';
 import { detectComicContainerFormat } from '../../../common/comic-format-detect';
 import { CbzService, matchesIfNoneMatch, type ComicPageResult } from './cbz.service';
 import { FakeSevenZip } from './test-helpers';
@@ -33,6 +34,7 @@ const mockCreateReadStream = createReadStream as unknown as MockedFunction<typeo
 const mockCreateInflateRaw = createInflateRaw as unknown as MockedFunction<typeof createInflateRaw>;
 const mockListRarEntries = listRarEntries as MockedFunction<typeof listRarEntries>;
 const mockExtractRarEntry = extractRarEntry as MockedFunction<typeof extractRarEntry>;
+const mockMountHostArchive = mountHostArchive as MockedFunction<typeof mountHostArchive>;
 const mockGetSevenZip = getSevenZip as MockedFunction<typeof getSevenZip>;
 const mockDetectComicContainerFormat = detectComicContainerFormat as MockedFunction<typeof detectComicContainerFormat>;
 
@@ -139,6 +141,7 @@ describe('CbzService', () => {
   const user = { id: 9, isSuperuser: false, permissions: [] } as any;
   const bookService = { verifyFileAccess: vi.fn() };
 
+  const release = vi.fn();
   let service: CbzService;
 
   beforeEach(() => {
@@ -148,6 +151,7 @@ describe('CbzService', () => {
     mockStat.mockResolvedValue(fileStats(1_000, 100));
     let tempIds = 0;
     mockCreateSevenZipTempId.mockImplementation((prefix) => `${prefix}_${++tempIds}`);
+    mockMountHostArchive.mockImplementation((_sz, absolutePath) => ({ archivePath: `/src_mount/${basename(absolutePath)}`, release }));
   });
 
   it('counts visible CBZ images and caches the parsed index', async () => {
@@ -311,19 +315,20 @@ describe('CbzService', () => {
     expect(mockExtractRarEntry).not.toHaveBeenCalled();
   });
 
-  it('extracts CB7 pages once with folders kept, reuses the page list and drops the archive copy', async () => {
+  it('extracts CB7 pages once with folders kept, reuses the page list and reads the archive from the host', async () => {
     const sevenZip = new FakeSevenZip({ '10.jpg': 'ten', '2.png': 'two', '.hidden.jpg': 'h', 'notes.txt': 'n' });
     bookService.verifyFileAccess.mockResolvedValue({ format: 'cb7', absolutePath: '/books/eight.cb7' });
-    mockReadFile.mockResolvedValue(Buffer.from('7z') as unknown as Awaited<ReturnType<typeof readFile>>);
     mockGetSevenZip.mockResolvedValue(sevenZip as any);
 
     await expect(service.getPageCount(8, user)).resolves.toBe(2);
     const result = served(await service.streamPage(8, 0, user));
     await expect(readStream(result.stream)).resolves.toEqual(Buffer.from('two'));
     expect(result.mimeType).toBe('image/png');
-    expect(sevenZip.calls).toEqual([['x', '/comic8_1.7z', '-o/comic8_1', '-y']]);
-    expect(sevenZip.paths()).not.toContain('/comic8_1.7z');
-    expect(mockReadFile).toHaveBeenCalledTimes(1);
+    expect(sevenZip.calls).toEqual([['x', '/src_mount/eight.cb7', '-o/comic8_1', '-y']]);
+    expect(mockMountHostArchive).toHaveBeenCalledTimes(1);
+    expect(mockMountHostArchive).toHaveBeenCalledWith(sevenZip, '/books/eight.cb7');
+    expect(release).toHaveBeenCalledTimes(1);
+    expect(mockReadFile).not.toHaveBeenCalled();
   });
 
   it('keeps CB7 pages that share a name in different folders, in file-name order', async () => {
@@ -335,7 +340,6 @@ describe('CbzService', () => {
       '.thumbs/x.jpg': 'thumb',
     });
     bookService.verifyFileAccess.mockResolvedValue({ format: 'cb7', absolutePath: '/books/nested.cb7' });
-    mockReadFile.mockResolvedValue(Buffer.from('7z') as unknown as Awaited<ReturnType<typeof readFile>>);
     mockGetSevenZip.mockResolvedValue(sevenZip as any);
 
     await expect(service.getPageCount(15, user)).resolves.toBe(4);
@@ -352,11 +356,11 @@ describe('CbzService', () => {
       throw new Error('7z exited');
     });
     bookService.verifyFileAccess.mockResolvedValue({ format: 'cb7', absolutePath: '/books/broken.cb7' });
-    mockReadFile.mockResolvedValue(Buffer.from('7z') as unknown as Awaited<ReturnType<typeof readFile>>);
     mockGetSevenZip.mockResolvedValue(sevenZip as any);
 
     await expect(service.getPageCount(16, user)).rejects.toThrow('7z exited');
     expect(sevenZip.paths()).toEqual([]);
+    expect(release).toHaveBeenCalledTimes(1);
   });
 
   it('throws for unsupported formats and CB7 index bounds', async () => {
@@ -365,7 +369,6 @@ describe('CbzService', () => {
       .mockResolvedValueOnce({ format: 'pdf', absolutePath: '/books/nine.pdf' })
       .mockResolvedValueOnce({ format: 'cb7', absolutePath: '/books/nine.cb7' });
     mockGetSevenZip.mockResolvedValue(new FakeSevenZip({ '1.jpg': 'one' }) as any);
-    mockReadFile.mockResolvedValue(Buffer.from('7z') as unknown as Awaited<ReturnType<typeof readFile>>);
 
     await expect(service.getPageCount(9, user)).rejects.toThrow('Unsupported comic format: pdf');
     await expect(service.streamPage(9, 0, user)).rejects.toThrow(NotFoundException);
@@ -444,7 +447,6 @@ describe('CbzService', () => {
     it('drops the previous CB7 extraction and serves pages from the new one', async () => {
       const sevenZip = new FakeSevenZip({ 'ch1/001.jpg': 'old' });
       bookService.verifyFileAccess.mockResolvedValue({ format: 'cb7', absolutePath: '/books/rewritten.cb7' });
-      mockReadFile.mockResolvedValue(Buffer.from('7z') as unknown as Awaited<ReturnType<typeof readFile>>);
       mockGetSevenZip.mockResolvedValue(sevenZip as any);
 
       await expect(service.getPageCount(22, user)).resolves.toBe(1);
